@@ -20,6 +20,7 @@ from vggmodel import *
 from resnetcifar import *
 
 from torch.utils.tensorboard import SummaryWriter
+writer = None 
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -49,10 +50,23 @@ def get_args():
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
     parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
+    parser.add_argument('--per', action='store_true', help='evaluate personalization performance')
     # parser.add_argument('--accu_type', type=str, default='global', help='Target model to calculate accuracy (global/local)')
     args = parser.parse_args()
     return args
 
+
+def genTBRunName(args):
+    return  os.path.join("runs", "&".join([f"{args.alg}", 
+              f"{args.model}", 
+              f"lr={args.lr}", 
+              f"bs={args.batch_size}", 
+              f"n_parties={args.n_parties}"]))
+    
+    
+    
+    
+    
 def init_nets(net_configs, dropout_p, n_parties, args):
 
     nets = {net_i: None for net_i in range(n_parties)}
@@ -112,18 +126,15 @@ def init_nets(net_configs, dropout_p, n_parties, args):
 
     return nets, model_meta_data, layer_type
 
-def genTBComment(args):
-    ",".join([f"{args.alg}", 
-              f"lr={args.lr}", 
-              f"bs={args.batch_size}", 
-              f"n_parties={args.net}"])
 
 def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, device="cpu"):
     logger.info('Training network %s' % str(net_id))
 
-    train_acc = compute_accuracy(net, train_dataloader, device=device)
-    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
-
+    train_correct, train_total = compute_accuracy(net, train_dataloader, device=device)
+    test_correct, test_total, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+    train_acc = train_correct/float(train_total)
+    test_acc = test_correct/float(test_total)
+    
     logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
     logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
 
@@ -141,8 +152,6 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
         pass
     else:
         train_dataloader = [train_dataloader]
-
-    writer = SummaryWriter(comment=f"lr_{args.lr}")
 
     for epoch in range(epochs):
         epoch_loss_collector = []
@@ -167,11 +176,13 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
         epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
         logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
 
-        train_acc = compute_accuracy(net, train_dataloader, device=device)
-        test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
-
-        writer.add_scalar(f'PAccuracy/train_{net_id}', train_acc, epoch)
-        writer.add_scalar(f'Accuracy/test_{net_id}', test_acc, epoch)
+        train_correct, train_total = compute_accuracy(net, train_dataloader, device=device)
+        test_correct, test_total, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+        train_acc = train_correct/float(train_total)
+        test_acc = test_correct/float(test_total)
+    
+        # writer.add_scalar(f'Net_{net_id}/Accuracy/train', train_acc, epoch)
+        # writer.add_scalar(f'Net_{net_id}/Accuracy/test', test_acc, epoch)
 
         # if epoch % 10 == 0:
         #     logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
@@ -181,15 +192,16 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
         #     logger.info('>> Training accuracy: %f' % train_acc)
         #     logger.info('>> Test accuracy: %f' % test_acc)
 
-    train_acc = compute_accuracy(net, train_dataloader, device=device)
-    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+    train_correct, train_total = compute_accuracy(net, train_dataloader, device=device)
+    test_correct, test_total, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+    train_acc = train_correct/float(train_total)
+    test_acc = test_correct/float(test_total)
 
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
 
-
     logger.info(' ** Training complete **')
-    return train_acc, test_acc
+    return train_acc, test_acc, conf_matrix
 
 
 
@@ -272,15 +284,26 @@ def view_image(train_dataloader):
         exit(0)
 
 
-def local_train_net(nets, selected, args, net_dataidx_map, test_dl = None, device="cpu"):
+def local_train_net(round, nets, selected, args, net_dataidx_map_train, net_dataidx_map_test=None, device="cpu"):
     avg_acc = 0.0
-
+    if args.per:
+        total_local_correct = 0
+        total_local_count = 0
+        total_global_correct = 0
+        total_global_count = 0
+        avg_acc_local = 0.0
+        # avg_acc_global = 0.0
+        
     for net_id, net in nets.items():
         if net_id not in selected:
             continue
-        dataidxs = net_dataidx_map[net_id]
+        dataidxs_train = net_dataidx_map_train[net_id]
+        if net_dataidx_map_test is not None:
+            dataidxs_test = net_dataidx_map_test[net_id]
+        else:
+            dataidxs_test = None
 
-        logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
+        logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs_train)))
         # move the model to cuda device:
         net.to(device)
 
@@ -289,22 +312,66 @@ def local_train_net(nets, selected, args, net_dataidx_map, test_dl = None, devic
             noise_level = 0
 
         if args.noise_type == 'space':
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            train_dl_local, test_dl_local, _, _ = get_dataloader(dataset=args.dataset, 
+                                                                 datadir=args.datadir, 
+                                                                 train_bs=args.batch_size, 
+                                                                 test_bs=32, 
+                                                                 dataidxs_train=dataidxs_train, 
+                                                                 dataidxs_test=dataidxs_test,
+                                                                 noise_level=noise_level, 
+                                                                 net_id=net_id, 
+                                                                 total=args.n_parties-1)
         else:
             noise_level = args.noise / (args.n_parties - 1) * net_id
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+            train_dl_local, test_dl_local, _, _ = get_dataloader(dataset=args.dataset, 
+                                                                 datadir=args.datadir, 
+                                                                 train_bs=args.batch_size, 
+                                                                 test_bs=32, 
+                                                                 dataidxs_train=dataidxs_train, 
+                                                                 dataidxs_test=dataidxs_test,
+                                                                 noise_level=noise_level)
+        
         n_epoch = args.epochs
+        _, test_dl_global, _, _ = get_dataloader(dataset=args.dataset, 
+                                                datadir=args.datadir, 
+                                                train_bs=args.batch_size, 
+                                                test_bs=32)
 
-
-        trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, device=device)
-        logger.info("net %d final test acc %f" % (net_id, testacc))
-        avg_acc += testacc
+        
+        train_acc, test_acc, conf_matrix = train_net(net_id, net, train_dl_local, test_dl_global, n_epoch, args.lr, args.optimizer, device=device)
+        logger.info("net %d final test acc %f" % (net_id, test_acc))
+        avg_acc += test_acc
+        
+        if args.per: 
+            test_correct, test_total, conf_matrix = compute_accuracy(net, test_dl_local, get_confusion_matrix=True, device=device)
+            total_local_correct += test_correct
+            total_local_count += test_total
+            avg_acc_local += test_correct/float(test_total)
+            writer.add_scalar(f'Accuracy_Net[{net_id}]/Test_Local', test_correct/float(test_total), round)
+            
+            
+            test_correct, test_total, conf_matrix = compute_accuracy(net, test_dl_global, get_confusion_matrix=True, device=device)
+            total_global_correct += test_correct
+            total_global_count += test_total
+            # avg_acc_global += test_correct/float(test_total) # == avg_acc
+            writer.add_scalar(f'Accuracy_Net[{net_id}]/Test_Global', test_correct/float(test_total), round)
+        
+        
         # saving the trained models here
         # save_model(net, net_id, args)
         # else:
         #     load_model(net, net_id, device=device)
-    avg_acc /= len(selected)
+    
+    # Local models tested on global testset
+    writer.add_scalar(f'Accuracy/Test_Local/Macro_Global', avg_acc/float(len(selected)), round)
+    writer.add_scalar(f'Accuracy/Test_Local/Micro_Global', total_global_correct/float(total_global_count), round)
+    print(total_global_correct, "/", total_global_count)
+    if args.per:
+        # Local models tested on local testset
+        writer.add_scalar(f'Accuracy/Test_Local/Macro_Local', avg_acc_local/float(len(selected)), round)
+        writer.add_scalar(f'Accuracy/Test_Local/Micro_Local', total_local_correct/float(total_local_count), round)
+        print(total_local_correct, "/", total_local_count)
+        exit(0)
     if args.alg == 'local_training':
         logger.info("avg test acc %f" % avg_acc)
 
@@ -637,23 +704,37 @@ if __name__ == '__main__':
     logger.setLevel(logging.DEBUG)
     logger.info(device)
 
+
+    writer = SummaryWriter(genTBRunName(args))
+
     seed = args.init_seed
     logger.info("#" * 100)
     np.random.seed(seed)
     torch.manual_seed(seed)
     logger.info("Partitioning data")
-    X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(
-        args.dataset, args.datadir, args.logdir, args.partition, args.n_parties, beta=args.beta)
-
+    X_train, y_train, X_test, y_test, net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts = partition_data(dataset=args.dataset, 
+                                                                                             datadir=args.datadir, 
+                                                                                             logdir=args.logdir, 
+                                                                                             partition=args.partition, 
+                                                                                             n_parties=args.n_parties, 
+                                                                                             beta=args.beta)
+    # Sanity Check
+    # print(sum(list(map(lambda x: len(x), net_dataidx_map_train.values()))))
+    # print(sum(list(map(lambda x: len(x), net_dataidx_map_test.values()))))
+    # print(len(X_train))
+    # print(len(X_test))
+    
     n_classes = len(np.unique(y_train))
 
-    train_dl_global, test_dl_global, train_ds_global, test_ds_global = get_dataloader(args.dataset,
-                                                                                        args.datadir,
-                                                                                        args.batch_size,
-                                                                                        32)
+    train_dl_global, test_dl_global, train_ds_global, test_ds_global = get_dataloader(dataset=args.dataset,
+                                                                                      datadir=args.datadir,
+                                                                                      train_bs=args.batch_size,
+                                                                                      test_bs=32)
 
     print("len train_dl_global:", len(train_ds_global))
-
+    print("len test_dl_global:", len(test_ds_global))
+    print("len train_dl_local:", list(map(lambda x: len(x), net_dataidx_map_train.values())))
+    print("len test_dl_local:", list(map(lambda x: len(x), net_dataidx_map_test.values())))
 
     data_size = len(test_ds_global)
 
@@ -663,17 +744,36 @@ if __name__ == '__main__':
     test_all_in_list = []
     if args.noise > 0:
         for party_id in range(args.n_parties):
-            dataidxs = net_dataidx_map[party_id]
-
+            dataidxs_train = net_dataidx_map_train[party_id]
+            if args.per:
+                dataidxs_test = net_dataidx_map_test[party_id]
+            else:
+                dataidxs_test = None
             noise_level = args.noise
             if party_id == args.n_parties - 1:
                 noise_level = 0
 
             if args.noise_type == 'space':
-                train_dl_local, test_dl_local, train_ds_local, test_ds_local = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, party_id, args.n_parties-1)
+                train_dl_local, test_dl_local, train_ds_local, test_ds_local = get_dataloader(dataset=args.dataset, 
+                                                                                              datadir=args.datadir, 
+                                                                                              train_bs=args.batch_size, 
+                                                                                              test_bs=32, 
+                                                                                              dataidxs_train=dataidxs_train,
+                                                                                              dataidxs_test=dataidxs_test, 
+                                                                                              noise_level=noise_level, 
+                                                                                              net_id=party_id, 
+                                                                                              total=args.n_parties-1)
             else:
                 noise_level = args.noise / (args.n_parties - 1) * party_id
-                train_dl_local, test_dl_local, train_ds_local, test_ds_local = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
+                train_dl_local, test_dl_local, train_ds_local, test_ds_local = get_dataloader(dataset=args.dataset, 
+                                                                                              datadir=args.datadir, 
+                                                                                              train_bs=args.batch_size, 
+                                                                                              test_bs=32, 
+                                                                                              dataidxs_train=dataidxs_train,
+                                                                                              dataidxs_test=dataidxs_test, 
+                                                                                              noise_level=noise_level, 
+                                                                                              net_id=None, 
+                                                                                              total=0)
             train_all_in_list.append(train_ds_local)
             test_all_in_list.append(test_ds_local)
         train_all_in_ds = data.ConcatDataset(train_all_in_list)
@@ -710,12 +810,15 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            local_train_net(nets, selected, args, net_dataidx_map, test_dl = test_dl_global, device=device)
+            if args.per:
+                local_train_net(round, nets, selected, args, net_dataidx_map_train, net_dataidx_map_test=net_dataidx_map_test, device=device)
+            else:
+                local_train_net(round, nets, selected, args, net_dataidx_map_train, net_dataidx_map_test=None, device=device)
             # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
 
             # update global model
-            total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
-            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
+            total_train_data_points = sum([len(net_dataidx_map_train[r]) for r in selected])
+            fed_avg_freqs = [len(net_dataidx_map_train[r]) / total_train_data_points for r in selected]
 
             for idx in range(len(selected)):
                 net_para = nets[selected[idx]].cpu().state_dict()
@@ -727,25 +830,22 @@ if __name__ == '__main__':
                         global_para[key] += net_para[key] * fed_avg_freqs[idx]
             global_model.load_state_dict(global_para)
 
+
+            # Evaluate Global Model
             logger.info('global n_training: %d' % len(train_dl_global))
             logger.info('global n_test: %d' % len(test_dl_global))
-
-
-            train_acc = compute_accuracy(global_model, train_dl_global)
-            test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True)
-
+            
+            train_correct, train_total = compute_accuracy(global_model, train_dl_global)
+            test_correct, test_total, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True)
+            train_acc = train_correct/float(train_total)
+            test_acc = test_correct/float(test_total)
+            
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
             
-            
-            train_acc = compute_accuracy(global_model, train_dl_global)
-            test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True)
-
-            logger.info('>> Local Model Train (micro) accuracy: %f' % train_acc)
-            logger.info('>> Global Model Test (micro) accuracy: %f' % test_acc)
-            
-            writer.add_scalar('Accuracy/train', train_acc, round)
-            writer.add_scalar('Accuracy/test',test_acc, round)
+            # Global models tested on global testset
+            writer.add_scalar('Accuracy/Train_Global', train_acc, round)
+            writer.add_scalar('Accuracy/Test_Global',test_acc, round)
 
 
     elif args.alg == 'fedprox':

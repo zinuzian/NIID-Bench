@@ -327,6 +327,9 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
         else:
             times=[0 for i in range(10)]
             contain=[]
+            data_cnt_train = dict()
+            data_cnt_test = dict()
+            
             for i in range(n_parties):
                 current=[i%K]
                 times[i%K]+=1
@@ -339,6 +342,7 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
                         times[ind]+=1
                 contain.append(current)
             net_dataidx_map ={i:np.ndarray(0,dtype=np.int64) for i in range(n_parties)}
+            net_dataidx_map_test ={i:np.ndarray(0,dtype=np.int64) for i in range(n_parties)}
             for i in range(K):
                 idx_k = np.where(y_train==i)[0]
                 np.random.shuffle(idx_k)
@@ -348,6 +352,16 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
                     if i in contain[j]:
                         net_dataidx_map[j]=np.append(net_dataidx_map[j],split[ids])
                         ids+=1
+                        
+                idx_k = np.where(y_test==i)[0]
+                np.random.shuffle(idx_k)
+                split = np.array_split(idx_k,times[i])
+                ids=0
+                for j in range(n_parties):
+                    if i in contain[j]:
+                        net_dataidx_map_test[j]=np.append(net_dataidx_map_test[j],split[ids])
+                        ids+=1
+            print("Each nodes contains:", contain)
 
     elif partition == "iid-diff-quantity":
         idxs = np.random.permutation(n_train)
@@ -424,7 +438,7 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
                 net_dataidx_map[i]=np.append(net_dataidx_map[i], np.arange(user[j], user[j+1]))
 
     traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map, logdir)
-    return (X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts)
+    return (X_train, y_train, X_test, y_test, net_dataidx_map, net_dataidx_map_test, traindata_cls_counts)
 
 
 def get_trainable_parameters(net):
@@ -498,9 +512,9 @@ def compute_accuracy(model, dataloader, get_confusion_matrix=False, device="cpu"
         model.train()
 
     if get_confusion_matrix:
-        return correct/float(total), conf_matrix
+        return correct, total, conf_matrix
 
-    return correct/float(total)
+    return correct, total
 
 
 def save_model(model, model_index, args):
@@ -543,7 +557,7 @@ class AddGaussianNoise(object):
     def __repr__(self):
         return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
 
-def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_level=0, net_id=None, total=0):
+def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs_train=None, dataidxs_test=None, noise_level=0, net_id=None, total=0):
     if dataset in ('mnist', 'femnist', 'fmnist', 'cifar10', 'svhn', 'generated', 'covtype', 'a9a', 'rcv1', 'SUSY'):
         if dataset == 'mnist':
             dl_obj = MNIST_truncated
@@ -609,8 +623,8 @@ def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_lev
             transform_test = None
 
 
-        train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True)
-        test_ds = dl_obj(datadir, train=False, transform=transform_test, download=True)
+        train_ds = dl_obj(datadir, dataidxs=dataidxs_train, train=True, transform=transform_train, download=True)
+        test_ds = dl_obj(datadir, dataidxs=dataidxs_test, train=False, transform=transform_test, download=True)
 
         train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=False)
         test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=False)
